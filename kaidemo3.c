@@ -1,5 +1,5 @@
 /*
- * KAI DEMO2 for Multiple Instances
+ * KAI DEMO3 for KAI Mixer
  * Copyright (C) 2010-2021 KO Myung-Hun <komh@chollian.net>
  *
  * This file is a part of K Audio Interface.
@@ -31,7 +31,9 @@
 #define BUF_SIZE    1024
 
 static BOOL m_fQuit;
-static int  m_nThreads;
+
+static HKAIMIXER m_hkm;
+
 
 typedef struct tagCBDATA
 {
@@ -90,7 +92,7 @@ void playThread( void *arg )
     MMAUDIOHEADER   mmAudioHeader;
     LONG            lBytesRead;
     KAISPEC         ksWanted, ksObtained;
-    HKAI            hkai;
+    HKAIMIXERSTREAM hkms;
     CBDATA          cd;
 
     /* Open the audio file.
@@ -102,7 +104,7 @@ void playThread( void *arg )
     {
         fprintf( stderr, "[%s] Failed to open a wave file!!!\n", name );
 
-        goto exit_discount_threads;
+        return;
     }
 
     /* Get the audio file header.
@@ -123,31 +125,35 @@ void playThread( void *arg )
     ksWanted.ulSamplingRate     = mmAudioHeader.mmXWAVHeader.WAVEHeader.ulSamplesPerSec;
     ksWanted.ulDataFormat       = 0;
     ksWanted.ulChannels         = mmAudioHeader.mmXWAVHeader.WAVEHeader.usChannels;
-    ksWanted.ulNumBuffers       = 2;
+    ksWanted.ulNumBuffers       = 0;
     ksWanted.ulBufferSize       = 0;
     ksWanted.fShareable         = TRUE;
     ksWanted.pfnCallBack        = kaiCallback;
     ksWanted.pCallBackData      = &cd;
 
-    if( kaiOpen( &ksWanted, &ksObtained, &hkai ))
+    if( kaiMixerStreamOpen( m_hkm, &ksWanted, &ksObtained, &hkms ))
     {
-        fprintf( stderr, "[%s] Failed to open audio device!!!\n", name );
+        fprintf( stderr, "[%s] Failed to open a mixer stream!!!\n", name );
 
         goto exit_mmio_close;
     }
 
-    printf("[%s] hkai = %lx\n", name, hkai );
+    printf("[%s] hkms = %lx\n", name, hkms );
+    printf("[%s] Number of channels = %lu\n", name, ksObtained.ulChannels );
+    printf("[%s] Number of buffers = %lu\n", name, ksObtained.ulNumBuffers );
+    printf("[%s] Buffer size = %lu bytes\n", name, ksObtained.ulBufferSize );
+    printf("[%s] Silence = %02x\n", name, ksObtained.bSilence );
 
-    kaiSetVolume( hkai, MCI_SET_AUDIO_ALL, 50 );
+    kaiSetVolume( hkms, MCI_SET_AUDIO_ALL, 50 );
 
-    kaiSetSoundState( hkai, MCI_SET_AUDIO_ALL, TRUE );
+    kaiSetSoundState( hkms, MCI_SET_AUDIO_ALL, TRUE );
 
     printf("[%s] Trying to play...\n", name );
 
     //DosSetPriority( PRTYS_THREAD, PRTYC_TIMECRITICAL, PRTYD_MAXIMUM, 0 );
     while( 1 )
     {
-        switch( kaiPlay( hkai ))
+        switch( kaiPlay( hkms ))
         {
             case KAIE_NO_ERROR :
                 break;
@@ -169,28 +175,23 @@ void playThread( void *arg )
     //DosSetPriority( PRTYS_THREAD, PRTYC_REGULAR, 0, 0 );
 
     printf("[%s] Playing...\n", name );
-    while( !m_fQuit && !( kaiStatus( hkai ) & KAIS_COMPLETED ))
+    while( !m_fQuit && !( kaiStatus( hkms ) & KAIS_COMPLETED ))
         DosSleep( 1 );
 
     printf("[%s] Completed\n", name );
 
 exit_kai_close :
 
-    kaiClose( hkai );
+    if( kaiMixerStreamClose( m_hkm, hkms ))
+        fprintf( stderr, "Failed to close a mixer stream!!!\n");
 
 exit_mmio_close :
 
     mmioClose( hmmio, 0 );
-
-exit_discount_threads :
-
-    m_nThreads--;
 }
 
 static int play( const char *name )
 {
-    m_nThreads++;
-
     return _beginthread( playThread, NULL, 256 * 1024, ( void * )name );
 }
 
@@ -200,6 +201,7 @@ int main( int argc, char *argv[])
     ULONG           ulMode;
     const char     *modeName[] = {"DART", "UNIAUD"};
     KAICAPS         kaic;
+    KAISPEC         ksWanted, ksObtained;
     TID             tid1, tid2, tid3;
 
     ulMode = ( argc < 2 ) ? KAIM_AUTO : atoi( argv[ 1 ]);
@@ -217,14 +219,32 @@ int main( int argc, char *argv[])
 
     printf("Press ESC to quit\n");
 
+    ksWanted.usDeviceIndex      = 0;
+    ksWanted.ulType             = KAIT_PLAY;
+    ksWanted.ulBitsPerSample    = 16;
+    ksWanted.ulSamplingRate     = 44100;
+    ksWanted.ulDataFormat       = 0;
+    ksWanted.ulChannels         = 2;
+    ksWanted.ulNumBuffers       = 2;
+    ksWanted.ulBufferSize       = 512 * 2/* 16bits */ * 2/* channels */;
+    ksWanted.fShareable         = TRUE;
+    ksWanted.pfnCallBack        = NULL;
+    ksWanted.pCallBackData      = NULL;
+
+    if( kaiMixerOpen( &ksWanted, &ksObtained, &m_hkm ))
+    {
+        fprintf( stderr, "Failed to open a mixer!!!\n");
+
+        return 1;
+    }
+
     m_fQuit    = FALSE;
-    m_nThreads = 0;
 
     tid1 = play("demo1.wav");
     tid2 = play("demo2.wav");
     tid3 = play("demo3.wav");
 
-    while( !m_fQuit && m_nThreads )
+    while( !m_fQuit & !( kaiStatus( m_hkm ) & KAIS_COMPLETED ))
     {
         key = read_key();
 
@@ -237,6 +257,9 @@ int main( int argc, char *argv[])
     DosWaitThread( &tid1, DCWW_WAIT );
     DosWaitThread( &tid2, DCWW_WAIT );
     DosWaitThread( &tid3, DCWW_WAIT );
+
+    if( kaiMixerClose( m_hkm ))
+        fprintf( stderr, "Failed to close a mixer!!!\n");
 
     kaiDone();
 

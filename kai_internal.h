@@ -20,10 +20,15 @@
 #ifndef __KAI_INTERNAL_H__
 #define __KAI_INTERNAL_H__
 
+#define INCL_DOS
+#include <os2.h>
+
 #include <float.h>
 
+#include "kai.h"
+
 #ifdef __cplusplus
-exter "C" {
+extern "C" {
 #endif
 
 #ifdef __IBMC__
@@ -33,6 +38,10 @@ exter "C" {
 #define DECLARE_PFN( ret, callconv, name, arg ) ret ( callconv * name )arg
 #define DLLEXPORT __declspec(dllexport)
 #endif
+
+#define THREAD_STACK_SIZE   ( 1024 * 1024 )
+
+#define INITIAL_TIMEOUT ( 10 * 1000 )
 
 typedef struct tagKAIAPIS
 {
@@ -49,6 +58,13 @@ typedef struct tagKAIAPIS
     DECLARE_PFN( APIRET, APIENTRY, pfnClearBuffer, ( HKAI ));
     DECLARE_PFN( APIRET, APIENTRY, pfnStatus, ( HKAI ));
 } KAIAPIS, *PKAIAPIS;
+
+PKAIAPIS _kaiGetApi( VOID );
+BOOL     _kaiIsDebugMode( VOID );
+BOOL     _kaiIsSoftVolume( VOID );
+ULONG    _kaiGetMinSamples( VOID );
+int      _kaiGetResamplerQ( VOID );
+ULONG    _kaiGetPlayLatency( VOID );
 
 static INLINE
 APIRET DosLoadModuleCW( PSZ pszName, ULONG cbName, PSZ pszModName,
@@ -67,6 +83,46 @@ APIRET DosLoadModuleCW( PSZ pszName, ULONG cbName, PSZ pszModName,
 }
 
 #define DosLoadModule( a, b, c, d ) DosLoadModuleCW( a, b, c, d )
+
+static INLINE
+VOID boostThread( VOID )
+{
+    if( getenv("KAI_TIMECRITICAL"))
+    {
+        PTIB ptib;
+
+        DosGetInfoBlocks( &ptib, NULL );
+
+        if( HIBYTE( ptib->tib_ptib2->tib2_ulpri ) != 0x03 )
+            DosSetPriority( PRTYS_THREAD, PRTYC_TIMECRITICAL, 0, 0 );
+    }
+}
+
+#define SAMPLESTOBYTES( s, ks ) (( s ) * (( ks ).ulBitsPerSample >> 3 ) * \
+                                 ( ks ).ulChannels )
+#define BYTESTOSAMPLES( b, ks ) (( b ) / (( ks ).ulBitsPerSample >> 3 ) / \
+                                 ( ks ).ulChannels )
+
+#define APPLY_SOFT_VOLUME( ptype, buf, size, pi )                       \
+do {                                                                    \
+    ptype pEnd = ( ptype )( buf ) + ( size ) / sizeof( *pEnd );         \
+    ptype p;                                                            \
+                                                                        \
+    for( p = ( ptype )( buf ); p < pEnd; p++ )                          \
+    {                                                                   \
+        *p = ( *p - ( pi )->ks.bSilence ) *                             \
+             ( pi )->lLeftVol / 100 * !!( pi )->fLeftState +            \
+             ( pi )->ks.bSilence;                                       \
+                                                                        \
+        if(( pi )->ks.ulChannels > 1 && ( p + 1 ) < pEnd )              \
+        {                                                               \
+            p++;                                                        \
+            *p = ( *p - ( pil )->ks.bSilence ) *                        \
+                 ( pi )->lRightVol / 100 * !!( pi )->fRightState +      \
+                 ( pi )->ks.bSilence;                                   \
+        }                                                               \
+    }                                                                   \
+} while( 0 )
 
 #ifdef __cplusplus
 }

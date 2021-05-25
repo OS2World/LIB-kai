@@ -38,7 +38,7 @@ extern "C" {
 #endif
 
 /** KAI version macro */
-#define KAI_VERSION     "1.3.1"
+#define KAI_VERSION     "2.1.0"
 
 /**
  * @defgroup kaimodes KAI modes
@@ -63,6 +63,7 @@ extern "C" {
 #define KAIE_NOT_ENOUGH_MEMORY      ( -7 )
 #define KAIE_INVALID_HANDLE         ( -8 )
 #define KAIE_NOT_READY              ( -9 )
+#define KAIE_STREAMS_NOT_CLOSED     ( -10 )
 /** @} */
 
 /** @defgroup kaitypes KAI types
@@ -124,6 +125,12 @@ typedef struct tagKAISPEC
 /** KAI handle */
 typedef ULONG HKAI, *PHKAI;
 
+/** KAI MIXER handle */
+typedef ULONG HKAIMIXER, *PHKAIMIXER;
+
+/** KAI MIXER STREAM handle */
+typedef ULONG HKAIMIXERSTREAM, *PHKAIMIXERSTREAM;
+
 /**
  * @brief Initialize KAI
  * @param[in] ulKaiMode KAI modes
@@ -138,6 +145,12 @@ APIRET APIENTRY kaiInit( ULONG ulKaiMode );
  * @return KAIE_NO_ERROR on success, or error codes
  */
 APIRET APIENTRY kaiDone( VOID );
+
+/**
+ * @brief Get initialization count of KAI
+ * @return Initialization count of KAI
+ */
+APIRET APIENTRY kaiGetInitCount( VOID );
 
 /**
  * @brief Query KAI capabilities
@@ -224,7 +237,7 @@ APIRET APIENTRY kaiSetVolume( HKAI hkai, ULONG ulCh, USHORT usVol );
  *            MCI_STATUS_AUDIO_LEFT for left channel
  *            MCI_STATUS_AUDIO_RIGHT for right channel
  *            MCI_STATUS_AUDIO_ALL for all channel
- * @return KAIE_NO_ERROR on success, or error codes
+ * @return Volume of a requested channel in percent
  */
 APIRET APIENTRY kaiGetVolume( HKAI hkai, ULONG ulCh );
 
@@ -264,6 +277,69 @@ APIRET APIENTRY kaiEnableSoftVolume( HKAI hkai, BOOL fEnable );
  */
 APIRET APIENTRY kaiFloatToS16( short *dst, int dstLen,
                                float *src, int srcLen );
+
+/**
+ * @brief Open KAIMIXER instance
+ * @param[in] pksWanted Requested specification
+ *            pksWanted->ulBitsPerSample should be 16
+ *            pksWanted->ulChannels should be 2
+ * @param[out] pksObtained Obtained specification
+ * @param[out] phkm Opened KAIMIXER instance
+ * @return KAIE_NO_ERROR on success, or error codes
+ * @remark pfnCallBack and pCallBackData of @a pksWanted are ignored
+ * @remark Only 16 bits stereo audio is supported
+ */
+APIRET APIENTRY kaiMixerOpen( const PKAISPEC pksWanted, PKAISPEC pksObtained,
+                              PHKAIMIXER phkm );
+
+/**
+ * @brief Close KAIMIXER instance
+ * @param[in] hkm KAIMIXER instance
+ * @return KAIE_NO_ERROR on success, or error codes
+ */
+APIRET APIENTRY kaiMixerClose( HKAIMIXER hkm );
+
+/**
+ * @brief Open KAIMIXERSTREAM instance
+ * @param[in] hkm KAIMIXER instance
+ * @param[in] pksWanted Requested specification
+ * @param[out] pksObtained Obtained specification
+ * @param[out] phkms Opened KAIMIXERSTREAM instance
+ * @return KAIE_NO_ERROR on success, or error codes
+ * @remark usDeviceIndex, ulNumBuffer, ulBufferSize and fShareble of
+ *         @a pksWanted are ignored
+ * @remark fShareble of @a pksObtained is always TRUE
+ */
+APIRET APIENTRY kaiMixerStreamOpen( HKAIMIXER hkm,
+                                    const PKAISPEC pksWanted,
+                                    PKAISPEC pksObtained,
+                                    PHKAIMIXERSTREAM phkms );
+
+/**
+ * @brief Close KAIMIXERSTREAM instance
+ * @param[in] hkm KAIMIXER instance
+ * @param[in] hkms KAIMIXERSTREAM instance
+ * @return KAIE_NO_ERROR on success, or error codes
+ */
+APIRET APIENTRY kaiMixerStreamClose( HKAIMIXER hkm, HKAIMIXERSTREAM hkms );
+
+/**
+ * @brief Enable soft mixer mode.
+ *        If enabled, #kaiOpen() and #kaiClose() behave like
+ *        #kaiMixerStreamOpen() and #kaiMixerStreamClose(), respectively.
+ * @param[in] fEnable Enable flag
+ *            TRUE to enable soft mixer mode
+ *            FALSE to disable soft mixer mode
+ * @param[in] pks Specification for a mixer
+ *            If @fEnable is TRUE and @pks is NULL, spec of a mixer does not
+ *            change.
+ * @return KAIE_NO_ERROR on success, or error codes
+ * @remark pfnCallBack and pCallBackData of @a pks are ignored
+ * @remark Default spec of a mixer is default device, 16 bits,
+ *         48 KHz, stereo, 2 buffers, KAI_MINSAMPLES samples if specified,
+ *         or 2048 samples, and shareable
+ */
+APIRET APIENTRY kaiEnableSoftMixer( BOOL fEnable, const PKAISPEC pks );
 
 #ifdef __cplusplus
 }

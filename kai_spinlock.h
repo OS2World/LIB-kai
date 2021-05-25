@@ -1,6 +1,6 @@
 /*
-    Uniaud Interface for K Audio Interface
-    Copyright (C) 2010-2015 by KO Myung-Hun <komh@chollian.net>
+    Recursive Spinlock for K Audio Interface
+    Copyright (C) 2021 by KO Myung-Hun <komh@chollian.net>
 
     This library is free software; you can redistribute it and/or
     modify it under the terms of the GNU Library General Public
@@ -17,16 +17,28 @@
     Software Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 */
 
-#ifndef __KAI_UNIAUD_H__
-#define __KAI_UNIAUD_H__
-
-#include <os2.h>
+#ifndef __KAI_SPINLOCK_H__
+#define __KAI_SPINLOCK_H__
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-APIRET APIENTRY _kaiUniaudInit( PKAIAPIS pkai, PKAICAPS pkc );
+#define SPINLOCK_INIT { 0, 0 }
+
+typedef struct SPINLOCK
+{
+    int owner;
+    int count;
+} SPINLOCK, *PSPINLOCK;
+
+VOID _kaiSpinLockInit( PSPINLOCK pLock );
+VOID _kaiSpinLock( PSPINLOCK pLock );
+VOID _kaiSpinUnlock( PSPINLOCK pLock );
+
+#define spinLockInit _kaiSpinLockInit
+#define spinLock     _kaiSpinLock
+#define spinUnlock   _kaiSpinUnlock
 
 #ifdef __cplusplus
 }

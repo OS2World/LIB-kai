@@ -1,6 +1,6 @@
 /*
-    Uniaud Interface for K Audio Interface
-    Copyright (C) 2010-2015 by KO Myung-Hun <komh@chollian.net>
+    Debug for K Audio Interface
+    Copyright (C) 2021 by KO Myung-Hun <komh@chollian.net>
 
     This library is free software; you can redistribute it and/or
     modify it under the terms of the GNU Library General Public
@@ -17,16 +17,16 @@
     Software Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 */
 
-#ifndef __KAI_UNIAUD_H__
-#define __KAI_UNIAUD_H__
-
-#include <os2.h>
+#ifndef __KAI_DEBUG_H_
+#define __KAI_DEBUG_H_
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-APIRET APIENTRY _kaiUniaudInit( PKAIAPIS pkai, PKAICAPS pkc );
+void _kaiDprintf( const char *format, ... );
+
+#define dprintf _kaiDprintf
 
 #ifdef __cplusplus
 }

@@ -1,3 +1,16 @@
+/*
+ * KAI DEMO
+ * Copyright (C) 2010-2021 KO Myung-Hun <komh@chollian.net>
+ *
+ * This file is a part of K Audio Interface.
+ *
+ * This program is free software. It comes without any warranty, to
+ * the extent permitted by applicable law. You can redistribute it
+ * and/or modify it under the terms of the Do What The Fuck You Want
+ * To Public License, Version 2, as published by Sam Hocevar. See
+ * http://www.wtfpl.net/ for more details.
+ */
+
 #define INCL_KBD
 #define INCL_DOS
 #include <os2.h>
@@ -19,15 +32,12 @@ static int  m_iBufLen = 0;
 
 static HMMIO m_hmmio;
 
-static volatile ULONG m_ulStatus = 0;
+static ULONG m_ulStatus = 0;
 
 ULONG APIENTRY kaiCallback ( PVOID pCBData, PVOID Buffer, ULONG BufferSize )
 {
     PBYTE   pbBuffer = Buffer;
     LONG    lLen;
-
-    if( m_ulStatus & KAIS_COMPLETED )
-        mmioSeek( m_hmmio, 0, SEEK_SET );
 
     while( BufferSize > 0 )
     {
@@ -48,6 +58,9 @@ ULONG APIENTRY kaiCallback ( PVOID pCBData, PVOID Buffer, ULONG BufferSize )
         pbBuffer     += lLen;
         BufferSize   -= lLen;
     }
+
+    if( BufferSize > 0 )
+        mmioSeek( m_hmmio, 0, SEEK_SET );
 
     return pbBuffer - ( PBYTE )Buffer;
 }

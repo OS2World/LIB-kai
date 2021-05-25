@@ -18,6 +18,7 @@
 */
 
 #define INCL_DOS
+#define INCL_DOSERRORS
 #include <os2.h>
 
 #include <string.h>
@@ -25,58 +26,45 @@
 
 #include "kai.h"
 #include "kai_internal.h"
+#include "kai_instance.h"
+#include "kai_mixer.h"
 #include "kai_dart.h"
 #include "kai_uniaud.h"
+#include "kai_spinlock.h"
+#include "kai_debug.h"
 
-#ifdef __KLIBC__
-#include <emx/umalloc.h>
-
-#define calloc _lcalloc
-#define malloc _lmalloc
-#endif
+#define DEFAULT_MIN_SAMPLES 2048
 
 static ULONG    m_ulInitCount = 0;
+static SPINLOCK m_lockInitCount = SPINLOCK_INIT;
+
 static KAIAPIS  m_kai = { NULL, };
 static KAICAPS  m_kaic = { 0, };
 
-typedef struct tagINSTANCELIST INSTANCELIST, *PINSTANCELIST;
-struct tagINSTANCELIST
-{
-    HKAI     hkai;
-    LONG     lLeftVol;
-    LONG     lRightVol;
-    BOOL     fLeftState;
-    BOOL     fRightState;
-    BOOL     fSoftVol;
-    KAISPEC  ks;
-    PFNKAICB pfnUserCb;
-    PVOID    pUserData;
+static BOOL     m_fDebugMode = FALSE;
+static BOOL     m_fSoftVol = FALSE;
+static BOOL     m_fSoftMixer = FALSE;
+static ULONG    m_ulMinSamples = DEFAULT_MIN_SAMPLES;
+static int      m_iResamplerQ = 0;
+static ULONG    m_ulPlayLatency = 100;
 
-    PINSTANCELIST    pilNext;
+static SPINLOCK  m_lockMixer = SPINLOCK_INIT;
+static HKAIMIXER m_hkm = NULLHANDLE;
+static KAISPEC   m_ks = {
+    0,                                      /* usDeviceIndex */
+    KAIT_PLAY,                              /* ulType */
+    16,                                     /* ulBitsPerSample */
+    48000,                                  /* ulSamplingRate */
+    0,                                      /* ulDataFormat */
+    2,                                      /* ulChannels */
+    2,                                      /* ulNumBuffers */
+    DEFAULT_MIN_SAMPLES * 2/* 16 bits */ *
+    2/* stereo */,                          /* ulBufferSize */
+    TRUE,                                   /* fShareable */
+    NULL,                                   /* pfnCallBack */
+    NULL,                                   /* pCallBackData */
+    0,                                      /* bSilence */
 };
-
-PINSTANCELIST m_pilStart = NULL;
-
-#define APPLY_SOFT_VOLUME( ptype, buf, size, pi )                       \
-do {                                                                    \
-    ptype pEnd = ( ptype )( buf ) + ( size ) / sizeof( *pEnd );         \
-    ptype p;                                                            \
-                                                                        \
-    for( p = ( buf ); p < pEnd; p++ )                                   \
-    {                                                                   \
-        *p = ( *p - ( pi )->ks.bSilence ) *                             \
-             ( pi )->lLeftVol / 100 * !!( pi )->fLeftState +            \
-             ( pi )->ks.bSilence;                                       \
-                                                                        \
-        if(( pi )->ks.ulChannels > 1 && ( p + 1 ) < pEnd )              \
-        {                                                               \
-            p++;                                                        \
-            *p = ( *p - ( pil )->ks.bSilence ) *                        \
-                 ( pi )->lRightVol / 100 * !!( pi )->fRightState +      \
-                 ( pi )->ks.bSilence;                                   \
-        }                                                               \
-    }                                                                   \
-} while( 0 )
 
 static ULONG APIENTRY kaiCallBack( PVOID pCBData, PVOID pBuffer,
                                    ULONG ulBufSize )
@@ -110,117 +98,99 @@ static ULONG APIENTRY kaiCallBack( PVOID pCBData, PVOID pBuffer,
     return ulLen;
 }
 
-static PINSTANCELIST instanceNew( VOID )
-{
-    PINSTANCELIST pilNew;
-
-    pilNew = calloc( 1, sizeof( INSTANCELIST ));
-    if( !pilNew )
-        return NULL;
-
-    pilNew->lLeftVol    = 100;
-    pilNew->lRightVol   = 100;
-    pilNew->fLeftState  = TRUE;
-    pilNew->fRightState = TRUE;
-
-    // Use the soft volume mode unless KAI_NOSOFTVOLUME is specified
-    pilNew->fSoftVol = getenv("KAI_NOSOFTVOLUME") ? FALSE : TRUE;
-
-    return pilNew;
-}
-
-static void instanceAdd( HKAI hkai, PINSTANCELIST pil )
-{
-    pil->hkai    = hkai;
-    pil->pilNext = m_pilStart;
-
-    m_pilStart = pil;
-}
-
-static VOID instanceDel( HKAI hkai )
-{
-    PINSTANCELIST pil, pilPrev = NULL;
-
-    for( pil = m_pilStart; pil; pil = pil->pilNext )
-    {
-        if( pil->hkai == hkai )
-            break;
-
-        pilPrev = pil;
-    }
-
-    if( !pil )
-        return;
-
-    if( pilPrev )
-        pilPrev->pilNext = pil->pilNext;
-    else
-        m_pilStart = pil->pilNext;
-
-    free( pil );
-}
-
-static VOID instanceDelAll( VOID )
-{
-    PINSTANCELIST pil, pilNext;
-
-    for( pil = m_pilStart; pil; pil = pilNext )
-    {
-        pilNext = pil->pilNext;
-        free( pil );
-    }
-
-    m_pilStart = NULL;
-}
-
-static PINSTANCELIST instanceVerify( HKAI hkai )
-{
-    PINSTANCELIST pil;
-
-    for( pil = m_pilStart; pil; pil = pil->pilNext )
-    {
-        if( pil->hkai == hkai )
-            break;
-    }
-
-    return pil;
-}
-
 APIRET DLLEXPORT APIENTRY kaiInit( ULONG ulMode )
 {
-    const char *pszAutoMode;
+    const char *pszEnv;
     APIRET rc = KAIE_INVALID_PARAMETER;
 
-    DosEnterCritSec();
+    spinLock( &m_lockInitCount );
 
     if( m_ulInitCount )
     {
         m_ulInitCount++;
-        DosExitCritSec();
+
+        spinUnlock( &m_lockInitCount );
 
         return KAIE_NO_ERROR;
     }
 
-    // Use the specified mode by KAI_AUTOMODE if auto mode
-    pszAutoMode = getenv("KAI_AUTOMODE");
-    if( ulMode == KAIM_AUTO && pszAutoMode )
+    // Enable debug mode if KAI_DEBUG is set
+    m_fDebugMode = getenv("KAI_DEBUG") != NULL;
+
+    // Use the soft volume mode unless KAI_NOSOFTVOLUME is specified
+    m_fSoftVol = getenv("KAI_NOSOFTVOLUME") ? FALSE : TRUE;
+
+    // Use the soft mixer mode unless KAI_NOSOFTMIXER is specified
+    m_fSoftMixer = getenv("KAI_NOSOFTMIXER") ? FALSE : TRUE;
+
+    // User the sampling rate of KAI_MIXERRATE if specified
+    pszEnv = getenv("KAI_MIXERRATE");
+    if( pszEnv )
     {
-        if( !stricmp(pszAutoMode, "UNIAUD"))
+        ULONG ulRate = atoi( pszEnv );
+
+        if( ulRate != 0 )
+            m_ks.ulSamplingRate = ulRate;
+    }
+
+    // Use the minimum samples of KAI_MINSAMPLES if specified
+    pszEnv = getenv("KAI_MINSAMPLES");
+    if( pszEnv )
+    {
+        ULONG ulMinSamples = atoi( pszEnv );
+
+        if( ulMinSamples != 0 )
+        {
+            m_ulMinSamples = ulMinSamples;
+            m_ks.ulBufferSize = SAMPLESTOBYTES( m_ulMinSamples, m_ks );
+        }
+    }
+
+    // User the resampler quality of KAI_RESAMPLERQ if specified
+    pszEnv = getenv("KAI_RESAMPLERQ");
+    if( pszEnv )
+    {
+        int q = atoi( pszEnv );
+
+        if( q < 0 )
+            q = 0;
+        else if( q > 10 )
+            q = 10;
+
+        m_iResamplerQ = q;
+    }
+
+    // Use the latency of KAI_PLAYLATENCY if specified
+    pszEnv = getenv("KAI_PLAYLATENCY");
+    if( pszEnv )
+    {
+        int latency = atoi( pszEnv );
+        if( latency < 0 )
+            latency = 0;
+
+        m_ulPlayLatency = latency;
+    }
+
+    // Use the specified mode by KAI_AUTOMODE if auto mode
+    pszEnv = getenv("KAI_AUTOMODE");
+    if( ulMode == KAIM_AUTO && pszEnv )
+    {
+        if( !stricmp(pszEnv, "UNIAUD"))
             ulMode = KAIM_UNIAUD;
-        else if( !stricmp(pszAutoMode, "DART"))
+        else if( !stricmp(pszEnv, "DART"))
             ulMode = KAIM_DART;
     }
 
     if( ulMode == KAIM_UNIAUD || ulMode == KAIM_AUTO )
     {
-        rc = kaiUniaudInit( &m_kai, &m_kaic );
+        rc = _kaiUniaudInit( &m_kai, &m_kaic );
         if( !rc )
             ulMode = KAIM_UNIAUD;
     }
 
     if( ulMode == KAIM_DART || ulMode == KAIM_AUTO )
     {
-        rc = kaiDartInit( &m_kai, &m_kaic );
+        rc = _kaiDartInit( &m_kai, &m_kaic );
         if( !rc )
             ulMode = KAIM_DART;
     }
@@ -228,7 +198,7 @@ APIRET DLLEXPORT APIENTRY kaiInit( ULONG ulMode )
     if( !rc )
         m_ulInitCount++;
 
-    DosExitCritSec();
+    spinUnlock( &m_lockInitCount );
 
     return rc;
 }
@@ -237,7 +207,7 @@ APIRET DLLEXPORT APIENTRY kaiDone( VOID )
 {
     APIRET rc;
 
-    DosEnterCritSec();
+    spinLock( &m_lockInitCount );
 
     if( !m_ulInitCount )
         rc = KAIE_NOT_INITIALIZED;
@@ -254,9 +224,14 @@ APIRET DLLEXPORT APIENTRY kaiDone( VOID )
             instanceDelAll();
     }
 
-    DosExitCritSec();
+    spinUnlock( &m_lockInitCount );
 
     return rc;
+}
+
+APIRET DLLEXPORT APIENTRY kaiGetInitCount( VOID )
+{
+    return m_ulInitCount;
 }
 
 APIRET DLLEXPORT APIENTRY kaiCaps( PKAICAPS pkc )
@@ -277,7 +252,7 @@ APIRET DLLEXPORT APIENTRY kaiOpen( const PKAISPEC pksWanted,
 {
     PINSTANCELIST pil;
 
-    APIRET rc;
+    APIRET rc = KAIE_NO_ERROR;
 
     if( !m_ulInitCount )
         return KAIE_NOT_INITIALIZED;
@@ -288,11 +263,27 @@ APIRET DLLEXPORT APIENTRY kaiOpen( const PKAISPEC pksWanted,
     if( !pksWanted->pfnCallBack )
         return KAIE_INVALID_PARAMETER;
 
-    pil = instanceNew();
+    if( m_fSoftMixer )
+    {
+        /* Soft mixer mode */
+        spinLock( &m_lockMixer );
+
+        rc = streamOpen( &m_ks, &m_hkm, pksWanted, pksObtained, phkai );
+
+        spinUnlock( &m_lockMixer );
+
+        return rc;
+    }
+
+    /* Normal mode */
+    pil = instanceNew( FALSE, NULL, NULL );
     if( !pil )
         return KAIE_NOT_ENOUGH_MEMORY;
 
     memcpy( &pil->ks, pksWanted, sizeof( KAISPEC ));
+    if( pil->ks.ulBufferSize > 0 &&
+        pil->ks.ulBufferSize < SAMPLESTOBYTES( m_ulMinSamples, pil->ks ))
+        pil->ks.ulBufferSize = SAMPLESTOBYTES( m_ulMinSamples, pil->ks );
     pil->ks.pfnCallBack   = kaiCallBack;
     pil->ks.pCallBackData = pil;
     pil->pfnUserCb        = pksWanted->pfnCallBack;
@@ -301,7 +292,7 @@ APIRET DLLEXPORT APIENTRY kaiOpen( const PKAISPEC pksWanted,
     rc = m_kai.pfnOpen( &pil->ks, phkai );
     if( rc )
     {
-        free( pil );
+        instanceFree( pil );
 
         return rc;
     }
@@ -310,21 +301,38 @@ APIRET DLLEXPORT APIENTRY kaiOpen( const PKAISPEC pksWanted,
     pksObtained->pfnCallBack   = pksWanted->pfnCallBack;
     pksObtained->pCallBackData = pksWanted->pCallBackData;
 
-    instanceAdd( *phkai, pil );
+    instanceAdd( *phkai, *phkai, pil );
 
     return KAIE_NO_ERROR;
 }
 
 APIRET DLLEXPORT APIENTRY kaiClose( HKAI hkai )
 {
-    APIRET rc;
+    PINSTANCELIST pil;
+    APIRET rc = KAIE_NO_ERROR;
 
     if( !m_ulInitCount )
         return KAIE_NOT_INITIALIZED;
 
-    if( !instanceVerify( hkai ))
+    if( !( pil = instanceVerify( hkai, IVF_NORMAL | IVF_STREAM )))
         return KAIE_INVALID_HANDLE;
 
+    if( ISSTREAM( pil ) && pil->hkai != m_hkm )
+        return KAIE_INVALID_HANDLE;
+
+    if( m_fSoftMixer )
+    {
+        /* Soft mixer mode */
+        spinLock( &m_lockMixer );
+
+        rc = streamClose( &m_hkm, hkai );
+
+        spinUnlock( &m_lockMixer );
+
+        return rc;
+    }
+
+    /* Normal mode */
     rc = m_kai.pfnClose( hkai );
     if( rc )
         return rc;
@@ -336,58 +344,133 @@ APIRET DLLEXPORT APIENTRY kaiClose( HKAI hkai )
 
 APIRET DLLEXPORT APIENTRY kaiPlay( HKAI hkai )
 {
+    PINSTANCELIST pil;
+    APIRET rc;
+
     if( !m_ulInitCount )
         return KAIE_NOT_INITIALIZED;
 
-    if( !instanceVerify( hkai ))
+    if( !( pil = instanceVerify( hkai, IVF_NORMAL | IVF_STREAM )))
         return KAIE_INVALID_HANDLE;
 
-    return m_kai.pfnPlay( hkai );
+    instanceLock( pil );
+
+    if( ISSTREAM( pil ))
+    {
+        /* Mixer stream */
+        rc = streamPlay( pil );
+    }
+    else
+    {
+        /* Normal instance */
+        rc = m_kai.pfnPlay( hkai );
+    }
+
+    instanceUnlock( pil );
+
+    return rc;
 }
 
 APIRET DLLEXPORT APIENTRY kaiStop( HKAI hkai )
 {
+    PINSTANCELIST pil;
+    APIRET rc;
+
     if( !m_ulInitCount )
         return KAIE_NOT_INITIALIZED;
 
-    if( !instanceVerify( hkai ))
+    if( !( pil = instanceVerify( hkai, IVF_NORMAL | IVF_STREAM )))
         return KAIE_INVALID_HANDLE;
 
-    return m_kai.pfnStop( hkai );
+    instanceLock( pil );
+
+    if( ISSTREAM( pil ))
+    {
+        /* Mixer stream */
+        rc = streamStop( pil );
+    }
+    else
+    {
+        /* Normal instance */
+        rc = m_kai.pfnStop( hkai );
+    }
+
+    instanceUnlock( pil );
+
+    return rc;
 }
 
 APIRET DLLEXPORT APIENTRY kaiPause( HKAI hkai )
 {
+    PINSTANCELIST pil;
+    APIRET rc;
+
     if( !m_ulInitCount )
         return KAIE_NOT_INITIALIZED;
 
-    if( !instanceVerify( hkai ))
+    if( !( pil = instanceVerify( hkai, IVF_NORMAL | IVF_STREAM )))
         return KAIE_INVALID_HANDLE;
 
-    return m_kai.pfnPause( hkai );
+    instanceLock( pil );
+
+    if( ISSTREAM( pil ))
+    {
+        /* Mixer stream */
+        rc = streamPause( pil );
+    }
+    else
+    {
+        /* Normal instance */
+        rc = m_kai.pfnPause( hkai );
+    }
+
+    instanceUnlock( pil );
+
+    return rc;
 }
 
 APIRET DLLEXPORT APIENTRY kaiResume( HKAI hkai )
 {
+    PINSTANCELIST pil;
+    APIRET rc;
+
     if( !m_ulInitCount )
         return KAIE_NOT_INITIALIZED;
 
-    if( !instanceVerify( hkai ))
+    if( !( pil = instanceVerify( hkai, IVF_NORMAL | IVF_STREAM )))
         return KAIE_INVALID_HANDLE;
 
-    return m_kai.pfnResume( hkai );
+    instanceLock( pil );
+
+    if( ISSTREAM( pil ))
+    {
+        /* Mixer stream */
+        rc = streamResume( pil );
+    }
+    else
+    {
+        /* Normal instance */
+        rc = m_kai.pfnResume( hkai );
+    }
+
+    instanceUnlock( pil );
+
+    return rc;
 }
 
 APIRET DLLEXPORT APIENTRY kaiSetSoundState( HKAI hkai, ULONG ulCh,
                                             BOOL fState )
 {
     PINSTANCELIST pil;
+    APIRET rc;
 
     if( !m_ulInitCount )
         return KAIE_NOT_INITIALIZED;
 
-    if( !( pil = instanceVerify( hkai )))
+    if( !( pil = instanceVerify( hkai, IVF_NORMAL | IVF_STREAM )))
         return KAIE_INVALID_HANDLE;
+
+    instanceLock( pil );
 
     if( pil->fSoftVol )
     {
@@ -399,21 +482,28 @@ APIRET DLLEXPORT APIENTRY kaiSetSoundState( HKAI hkai, ULONG ulCh,
             ( ulCh == MCI_SET_AUDIO_RIGHT || ulCh == MCI_SET_AUDIO_ALL ))
             pil->fRightState = fState;
 
-        return KAIE_NO_ERROR;
+        rc = KAIE_NO_ERROR;
     }
+    else
+        rc = m_kai.pfnSetSoundState( hkai, ulCh, fState );
 
-    return m_kai.pfnSetSoundState( hkai, ulCh, fState );
+    instanceUnlock( pil );
+
+    return rc;
 }
 
 APIRET DLLEXPORT APIENTRY kaiSetVolume( HKAI hkai, ULONG ulCh, USHORT usVol )
 {
     PINSTANCELIST pil;
+    APIRET rc;
 
     if( !m_ulInitCount )
         return KAIE_NOT_INITIALIZED;
 
-    if( !( pil = instanceVerify( hkai )))
+    if( !( pil = instanceVerify( hkai, IVF_NORMAL | IVF_STREAM )))
         return KAIE_INVALID_HANDLE;
+
+    instanceLock( pil );
 
     if( usVol > 100 )
         usVol = 100;
@@ -428,21 +518,28 @@ APIRET DLLEXPORT APIENTRY kaiSetVolume( HKAI hkai, ULONG ulCh, USHORT usVol )
             ( ulCh == MCI_SET_AUDIO_RIGHT || ulCh == MCI_SET_AUDIO_ALL ))
             pil->lRightVol = usVol;
 
-        return KAIE_NO_ERROR;
+        rc = KAIE_NO_ERROR;
     }
+    else
+        rc = m_kai.pfnSetVolume( hkai, ulCh, usVol );
 
-    return m_kai.pfnSetVolume( hkai, ulCh, usVol );
+    instanceUnlock( pil );
+
+    return rc;
 }
 
 APIRET DLLEXPORT APIENTRY kaiGetVolume( HKAI hkai, ULONG ulCh )
 {
     PINSTANCELIST pil;
+    APIRET rc;
 
     if( !m_ulInitCount )
         return KAIE_NOT_INITIALIZED;
 
-    if( !(pil = instanceVerify( hkai )))
+    if( !( pil = instanceVerify( hkai, IVF_NORMAL | IVF_STREAM )))
         return KAIE_INVALID_HANDLE;
+
+    instanceLock( pil );
 
     if( pil->fSoftVol )
     {
@@ -458,32 +555,72 @@ APIRET DLLEXPORT APIENTRY kaiGetVolume( HKAI hkai, ULONG ulCh )
             return lRightVol;
 
         /* ulCh == MCI_STATUS_AUDIO_ALL */
-        return ( lLeftVol + lRightVol ) / 2;
+        rc = ( lLeftVol + lRightVol ) / 2;
     }
+    else
+        rc = m_kai.pfnGetVolume( hkai, ulCh );
 
-    return m_kai.pfnGetVolume( hkai, ulCh );
+    instanceUnlock( pil );
+
+    return rc;
 }
 
 APIRET DLLEXPORT APIENTRY kaiClearBuffer( HKAI hkai )
 {
+    PINSTANCELIST pil;
+    APIRET rc;
+
     if( !m_ulInitCount )
         return KAIE_NOT_INITIALIZED;
 
-    if( !instanceVerify( hkai ))
+    if( !( pil = instanceVerify( hkai, IVF_NORMAL | IVF_STREAM )))
         return KAIE_INVALID_HANDLE;
 
-    return m_kai.pfnClearBuffer( hkai );
+    instanceLock( pil );
+
+    if( ISSTREAM( pil ))
+    {
+        /* Mixer stream */
+        rc = streamClearBuffer( pil );
+    }
+    else
+    {
+        /* Normal instance */
+        rc = m_kai.pfnClearBuffer( hkai );
+    }
+
+    instanceUnlock( pil );
+
+    return rc;
 }
 
 APIRET DLLEXPORT APIENTRY kaiStatus( HKAI hkai )
 {
+    PINSTANCELIST pil;
+    APIRET rc;
+
     if( !m_ulInitCount )
         return KAIE_NOT_INITIALIZED;
 
-    if( !instanceVerify( hkai ))
+    if( !( pil = instanceVerify( hkai, IVF_ANY )))
         return KAIE_INVALID_HANDLE;
 
-    return m_kai.pfnStatus( hkai );
+    instanceLock( pil );
+
+    if( ISSTREAM( pil ))
+    {
+        /* Mixer stream */
+        rc = streamStatus( pil );
+    }
+    else
+    {
+        /* Normal instance or mixer instance */
+        rc = m_kai.pfnStatus( hkai );
+    }
+
+    instanceUnlock( pil );
+
+    return rc;
 }
 
 APIRET DLLEXPORT APIENTRY kaiEnableSoftVolume( HKAI hkai, BOOL fEnable )
@@ -493,10 +630,14 @@ APIRET DLLEXPORT APIENTRY kaiEnableSoftVolume( HKAI hkai, BOOL fEnable )
     if( !m_ulInitCount )
         return KAIE_NOT_INITIALIZED;
 
-    if( !( pil = instanceVerify( hkai )))
+    if( !( pil = instanceVerify( hkai, IVF_NORMAL )))
         return KAIE_INVALID_HANDLE;
 
+    instanceLock( pil );
+
     pil->fSoftVol = fEnable;
+
+    instanceUnlock( pil );
 
     return KAIE_NO_ERROR;
 }
@@ -530,4 +671,51 @@ APIRET DLLEXPORT APIENTRY kaiFloatToS16( short *dst, int dstLen,
     }
 
     return (dst - dstStart) * sizeof( *dst );
+}
+
+APIRET DLLEXPORT APIENTRY kaiEnableSoftMixer( BOOL fEnable,
+                                              const PKAISPEC pks )
+{
+    if( !m_ulInitCount )
+        return KAIE_NOT_INITIALIZED;
+
+    spinLock( &m_lockMixer );
+
+    m_fSoftMixer = fEnable;
+    if( fEnable && pks )
+        memcpy( &m_ks, pks, sizeof( KAISPEC ));
+
+    spinUnlock( &m_lockMixer );
+
+    return KAIE_NO_ERROR;
+}
+
+PKAIAPIS _kaiGetApi( VOID )
+{
+    return &m_kai;
+}
+
+BOOL _kaiIsDebugMode( VOID )
+{
+    return m_fDebugMode;
+}
+
+BOOL _kaiIsSoftVolume( VOID )
+{
+    return m_fSoftVol;
+}
+
+ULONG _kaiGetMinSamples( VOID )
+{
+    return m_ulMinSamples;
+}
+
+int _kaiGetResamplerQ( VOID )
+{
+    return m_iResamplerQ;
+}
+
+ULONG _kaiGetPlayLatency( VOID )
+{
+    return m_ulPlayLatency;
 }

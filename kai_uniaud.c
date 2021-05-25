@@ -36,7 +36,10 @@
 
 #include "kai.h"
 #include "kai_internal.h"
+#include "kai_audiobuffer.h"
+#include "kai_atomic.h"
 #include "kai_uniaud.h"
+#include "kai_debug.h"
 
 #ifdef __KLIBC__
 #include <emx/umalloc.h>
@@ -49,32 +52,21 @@
 // So define macro for UNIAUD
 #define UNIAUD_EAGAIN   11
 
-#pragma pack( 1 )
-typedef struct ReSampleContext1
-{
-    void   *resample_context;
-    short  *temp[2];
-    int     temp_len;
-    float   ratio;
-    /* channel convert */
-    int     input_channels, output_channels, filter_channels;
-} ReSampleContext1;
-
+#pragma pack( 4 )
 typedef struct tagUNIAUDINFO
 {
     uniaud_pcm      *pcm;
     BYTE             bSilence;
     PFNKAICB         pfnUniaudCB;
     PVOID            pUniaudCBData;
-    PCH              pchBuffer;
-    HEV              hevFill;
-    HEV              hevFillDone;
+    ULONG            ulBufferSize;
+    ULONG            ulNumBuffers;
+    PKAIAUDIOBUFFER  pbuf;
     TID              tidPlayThread;
-    INT              nFillSize;
-    ULONG   volatile ulCount;
-    BOOL    volatile fPlaying;
-    BOOL    volatile fPaused;
-    BOOL    volatile fCompleted;
+    BOOL             fPlaying;
+    BOOL             fPaused;
+    BOOL             fCompleted;
+    BOOL             fFilling;
 } UNIAUDINFO, *PUNIAUDINFO;
 #pragma pack()
 
@@ -171,8 +163,6 @@ static DECLARE_PFN( int, _System, _uniaud_pcm_set_sw_params, ( uniaud_pcm *, snd
 static DECLARE_PFN( int, _System, uniaud_mixer_put_spdif_status, ( int, char *, int, int, int, int ));
 
 static HMODULE m_hmodUniaud = NULLHANDLE;
-
-static BOOL m_fDebugMode = FALSE;
 
 static APIRET APIENTRY uniaudDone( VOID );
 static APIRET APIENTRY uniaudOpen( PKAISPEC pks, PHKAI phkai );
@@ -358,7 +348,7 @@ exit_error :
     return FALSE;
 }
 
-APIRET APIENTRY kaiUniaudInit( PKAIAPIS pkai, PKAICAPS pkc )
+APIRET APIENTRY _kaiUniaudInit( PKAIAPIS pkai, PKAICAPS pkc )
 {
     UniaudCardInfo cardInfo;
 
@@ -384,8 +374,6 @@ APIRET APIENTRY kaiUniaudInit( PKAIAPIS pkai, PKAICAPS pkc )
     uniaud_get_card_info( 0, &cardInfo );
     strcpy( pkc->szPDDName, ( char * )cardInfo.name );
 
-    m_fDebugMode = getenv("KAIDEBUG") != NULL;
-
     return KAIE_NO_ERROR;
 }
 
@@ -399,16 +387,20 @@ static APIRET APIENTRY uniaudDone( VOID )
 static APIRET APIENTRY uniaudStop( HKAI hkai )
 {
     PUNIAUDINFO pui = ( PUNIAUDINFO )hkai;
+    TID tid;
 
     if( !pui->fPlaying )
         return KAIE_NO_ERROR;
 
     uniaud_pcm_drop( pui->pcm );
 
-    pui->fPlaying = FALSE;
-    pui->fPaused  = FALSE;
+    tid = pui->tidPlayThread;
 
-    while( DosWaitThread( &pui->tidPlayThread, DCWW_WAIT ) == ERROR_INTERRUPT );
+    STORE( &pui->fPlaying, FALSE );
+    STORE( &pui->fPaused, FALSE );
+
+    while( DosWaitThread( &tid, DCWW_WAIT ) == ERROR_INTERRUPT )
+        /* nothing */;
 
     return KAIE_NO_ERROR;
 }
@@ -417,17 +409,7 @@ static APIRET APIENTRY uniaudClearBuffer( HKAI hkai )
 {
     PUNIAUDINFO pui = ( PUNIAUDINFO )hkai;
 
-    memset( pui->pchBuffer, pui->bSilence, pui->pcm->bufsize );
-
-    return KAIE_NO_ERROR;
-}
-
-static APIRET APIENTRY uniaudFreeBuffers( HKAI hkai )
-{
-    PUNIAUDINFO pui = ( PUNIAUDINFO )hkai;
-
-    free( pui->pchBuffer );
-    pui->pchBuffer = NULL;
+    bufClear( pui->pbuf, pui->bSilence );
 
     return KAIE_NO_ERROR;
 }
@@ -435,22 +417,23 @@ static APIRET APIENTRY uniaudFreeBuffers( HKAI hkai )
 static void uniaudFillThread( void *arg )
 {
     PUNIAUDINFO pui = arg;
-    ULONG       ulPost;
+    PVOID pBuffer;
+    ULONG ulSize;
+    ULONG ulLength;
 
     //DosSetPriority( PRTYS_THREAD, PRTYC_TIMECRITICAL, PRTYD_MAXIMUM, 0 );
 
-    for(;;)
+    do
     {
-        while( DosWaitEventSem( pui->hevFill, SEM_INDEFINITE_WAIT ) == ERROR_INTERRUPT );
-        DosResetEventSem( pui->hevFill, &ulPost );
+        bufWriteLock( pui->pbuf, &pBuffer, &ulSize );
 
-        if( !pui->fPlaying )
+        if( !pui->fFilling )
             break;
 
-        pui->ulCount = pui->pfnUniaudCB( pui->pUniaudCBData, pui->pchBuffer, pui->nFillSize );
+        ulLength = pui->pfnUniaudCB( pui->pUniaudCBData, pBuffer, ulSize );
 
-        DosPostEventSem( pui->hevFillDone );
-    }
+        bufWriteUnlock( pui->pbuf, ulLength );
+    } while( ulLength == ulSize );
 }
 
 static void uniaudPlayThread( void *arg )
@@ -460,51 +443,53 @@ static void uniaudPlayThread( void *arg )
     int         err, ret, state;
     int         written;
     TID         tidFillThread;
-    ULONG       ulPost;
     PCH         pchBuffer;
+    PVOID       pBuffer;
+    ULONG       ulLength;
+    BOOL        fCompleted = FALSE;
 
-    //DosSetPriority( PRTYS_THREAD, PRTYC_TIMECRITICAL, PRTYD_MAXIMUM, 0 );
+    boostThread();
 
-    if( pui->pcm->multi_channels > 0 )
-        pui->nFillSize = pui->pcm->bufsize;
-    else
+    pchBuffer = malloc( pui->ulBufferSize );
+    pui->pbuf = bufCreate( pui->ulNumBuffers, pui->ulBufferSize );
+    if( !pchBuffer || !pui->pbuf )
     {
-        if( pui->pcm->resample && (( ReSampleContext1 * )( pui->pcm->resample ))->ratio >= 2.0f )
-            pui->nFillSize = pui->pcm->period_size;
-        else
-            pui->nFillSize = pui->pcm->period_size * 2;
-    }
-
-    pchBuffer = malloc( pui->nFillSize );
-    if( !pchBuffer )
-    {
-        pui->fPlaying = FALSE;
+        bufDestroy( pui->pbuf );
+        free( pchBuffer );
 
         return;
     }
 
-    DosCreateEventSem( NULL, &pui->hevFill, 0, TRUE );
-    DosCreateEventSem( NULL, &pui->hevFillDone, 0, FALSE );
-    tidFillThread = _beginthread( uniaudFillThread, NULL, 256 * 1024, pui );
+    STORE( &pui->fFilling, TRUE );
+
+    tidFillThread = _beginthread( uniaudFillThread, NULL, THREAD_STACK_SIZE,
+                                  pui );
 
     timeout *= pui->pcm->channels;
 
+    // prevent initial buffer-underrun and unnecessary latency
+    bufReadWaitDone( pui->pbuf, INITIAL_TIMEOUT );
+
+    STORE( &pui->fPlaying, TRUE );
+    STORE( &pui->fPaused, FALSE );
+    STORE( &pui->fCompleted, FALSE );
+
     while( pui->fPlaying )
     {
-        if( DosWaitEventSem( pui->hevFillDone, SEM_IMMEDIATE_RETURN ) == NO_ERROR )
+        if( bufReadLock( pui->pbuf, &pBuffer, &ulLength )
+            == 0 )
         {
-            DosResetEventSem( pui->hevFillDone, &ulPost );
+            memcpy( pchBuffer, pBuffer, ulLength );
+            count = ulLength;
 
-            memcpy( pchBuffer, pui->pchBuffer, pui->nFillSize );
-            count = pui->ulCount;
-
-            if( pui->ulCount == pui->nFillSize )
-                DosPostEventSem( pui->hevFill );
+            bufReadUnlock( pui->pbuf );
         }
         else
         {
-            memset( pchBuffer, pui->bSilence, pui->nFillSize );
-            count = pui->nFillSize;
+            dprintf("UNIAUD: buffer underrun!");
+
+            memset( pchBuffer, pui->bSilence, pui->ulBufferSize );
+            count = pui->ulBufferSize;
         }
 
         written = 0;
@@ -524,8 +509,7 @@ static void uniaudPlayThread( void *arg )
             if( err == -UNIAUD_EAGAIN )
             {
                 state = uniaud_pcm_state( pui->pcm );
-                if (m_fDebugMode)
-                    fprintf( stderr, "EAGAIN : written = %i of %i, state = %i\n", written, count, state );
+                dprintf("UNIAUD: EAGAIN : written = %i of %i, state = %i", written, count, state );
 
                 uniaud_pcm_drop( pui->pcm );
 
@@ -539,8 +523,7 @@ static void uniaudPlayThread( void *arg )
             {
                 if( err < -10000 )
                 {
-                    if (m_fDebugMode)
-                        fprintf( stderr, "part written = %i from %i, err = %i\n", written, count, err );
+                    dprintf("UNIAUD: part written = %i from %i, err = %i", written, count, err );
 
                     break; // internal uniaud error
                 }
@@ -560,25 +543,29 @@ static void uniaudPlayThread( void *arg )
             }
         }
 
-        if( count < pui->nFillSize )
+        if( count < pui->ulBufferSize )
         {
             // stop playing
-            pui->fPlaying = FALSE;
-            pui->fPaused  = FALSE;
             uniaud_pcm_drop( pui->pcm );
 
-            pui->fCompleted = TRUE;
+            fCompleted = TRUE;
             break;
         }
     }
 
-    DosPostEventSem( pui->hevFill );
-    while( DosWaitThread( &tidFillThread, DCWW_WAIT ) == ERROR_INTERRUPT );
-    DosCloseEventSem( pui->hevFill );
+    STORE( &pui->fFilling, FALSE );
 
-    DosCloseEventSem( pui->hevFillDone );
+    bufWritePostFill( pui->pbuf );
+    while( DosWaitThread( &tidFillThread, DCWW_WAIT ) == ERROR_INTERRUPT )
+        /* nothing */;
+
+    bufDestroy( pui->pbuf );
 
     free( pchBuffer );
+
+    STORE( &pui->fPlaying, FALSE );
+    STORE( &pui->fPaused, FALSE );
+    STORE( &pui->fCompleted, fCompleted );
 }
 
 static APIRET APIENTRY uniaudChNum( VOID )
@@ -623,28 +610,20 @@ static APIRET APIENTRY uniaudOpen( PKAISPEC pks, PHKAI phkai )
 
     if( !pui->pcm || err )
     {
-        if (m_fDebugMode)
-            fprintf( stderr, "pcm open error %d\n", err );
+        dprintf("UNIAUD: pcm open error %d", err );
 
-        goto exit_free;
-    }
+        free( pui );
 
-    pui->pchBuffer = malloc( pui->pcm->bufsize );
-    if( !pui->pchBuffer )
-    {
-        err = KAIE_NOT_ENOUGH_MEMORY;
-
-        goto exit_close;
+        return err;
     }
 
     pui->pfnUniaudCB   = pks->pfnCallBack;
     pui->pUniaudCBData = pks->pCallBackData;
+    pui->ulBufferSize  = pui->pcm->bufsize;
+    pui->ulNumBuffers  = pks->ulNumBuffers;
     pui->bSilence      = ( pks->ulBitsPerSample == BPS_8 ) ? 0x80 : 0x00;
 
-    memset( pui->pchBuffer, pui->bSilence, pui->pcm->bufsize );
-
-    pks->ulNumBuffers = pui->pcm->periods;
-    pks->ulBufferSize = pui->pcm->period_size;
+    pks->ulBufferSize = pui->ulBufferSize;
     pks->bSilence     = pui->bSilence;
 
     uniaud_pcm_prepare( pui->pcm );
@@ -652,14 +631,6 @@ static APIRET APIENTRY uniaudOpen( PKAISPEC pks, PHKAI phkai )
     *phkai = ( HKAI )pui;
 
     return KAIE_NO_ERROR;
-
-exit_close :
-    uniaud_pcm_close( pui->pcm );
-
-exit_free :
-    free( pui );
-
-    return err;
 }
 
 static APIRET APIENTRY uniaudClose( HKAI hkai )
@@ -667,7 +638,6 @@ static APIRET APIENTRY uniaudClose( HKAI hkai )
     PUNIAUDINFO pui = ( PUNIAUDINFO )hkai;
 
     uniaudStop( hkai );
-    uniaudFreeBuffers( hkai );
 
     uniaud_pcm_close( pui->pcm );
 
@@ -679,17 +649,21 @@ static APIRET APIENTRY uniaudClose( HKAI hkai )
 static APIRET APIENTRY uniaudPlay( HKAI hkai )
 {
     PUNIAUDINFO pui = ( PUNIAUDINFO )hkai;
+    ULONG       ulLatency;
 
     if( pui->fPlaying )
         return KAIE_NO_ERROR;
 
+    /* Workaround for uniaud which does not produce any sounds when trying to
+       play right after completed */
+    ulLatency = _kaiGetPlayLatency();
+    if( ulLatency )
+        DosSleep( ulLatency );
+
     uniaud_pcm_prepare( pui->pcm );
 
-    pui->fPlaying   = TRUE;
-    pui->fPaused    = FALSE;
-    pui->fCompleted = FALSE;
-
-    pui->tidPlayThread = _beginthread( uniaudPlayThread, NULL, 256 * 1024, pui );
+    pui->tidPlayThread = _beginthread( uniaudPlayThread, NULL,
+                                       THREAD_STACK_SIZE, pui );
 
     return KAIE_NO_ERROR;
 }
@@ -698,11 +672,14 @@ static APIRET APIENTRY uniaudPause( HKAI hkai )
 {
     PUNIAUDINFO pui = ( PUNIAUDINFO )hkai;
 
+    if( !pui->fPlaying )
+        return KAIE_NO_ERROR;
+
     if( pui->fPaused )
         return KAIE_NO_ERROR;
 
     uniaud_pcm_drop( pui->pcm );
-    pui->fPaused = TRUE;
+    STORE( &pui->fPaused, TRUE );
 
     return KAIE_NO_ERROR;
 }
@@ -711,11 +688,14 @@ static APIRET APIENTRY uniaudResume( HKAI hkai )
 {
     PUNIAUDINFO pui = ( PUNIAUDINFO )hkai;
 
+    if( !pui->fPlaying )
+        return KAIE_NO_ERROR;
+
     if( !pui->fPaused )
         return KAIE_NO_ERROR;
 
     uniaud_pcm_prepare( pui->pcm );
-    pui->fPaused = FALSE;
+    STORE( &pui->fPaused, FALSE );
 
     return KAIE_NO_ERROR;
 }
